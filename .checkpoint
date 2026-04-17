@@ -1,9 +1,9 @@
 {
   "version": 1,
   "slug": "fly-io-vs-vercel",
-  "step": "created",
-  "completed_specs": [],
-  "pending_specs": ["fly-pr-deploy", "fly-pr-config", "github-actions-e2e"],
+  "step": "deps_written",
+  "completed_specs": ["fly-pr-deploy", "fly-pr-config", "github-actions-e2e"],
+  "pending_specs": [],
   "created_at": "2026-04-17T00:00:00Z",
-  "updated_at": "2026-04-17T00:00:00Z"
+  "updated_at": "2026-04-17T00:00:01Z"
 }

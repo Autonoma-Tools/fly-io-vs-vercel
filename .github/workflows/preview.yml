@@ -1,0 +1,185 @@
+name: PR Preview + E2E
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+# Cancel in-flight runs for the same PR when a new commit lands.
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+env:
+  BASE_APP_NAME: myapp
+
+jobs:
+  deploy-preview:
+    # Create/update the preview environment on open, sync, and reopen.
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    outputs:
+      preview_url: ${{ steps.fly.outputs.preview_url }}
+      app_name: ${{ steps.fly.outputs.app_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy Fly preview app
+        id: fly
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          bash scripts/fly-preview.sh deploy \
+            "${{ github.event.pull_request.number }}" \
+            "$BASE_APP_NAME"
+
+      - name: Comment preview URL on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = '${{ steps.fly.outputs.preview_url }}';
+            const marker = '<!-- fly-preview-url -->';
+            const body = `${marker}\nPreview environment is live: ${url}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  e2e-tests:
+    # Trigger Autonoma E2E tests against the preview URL and block the PR on results.
+    needs: deploy-preview
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report pending status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'pending',
+              context: 'autonoma/e2e',
+              description: 'E2E tests running against preview',
+            });
+
+      - name: Trigger Autonoma E2E run
+        id: trigger
+        env:
+          AUTONOMA_API_KEY: ${{ secrets.AUTONOMA_API_KEY }}
+          PREVIEW_URL: ${{ needs.deploy-preview.outputs.preview_url }}
+        run: |
+          set -euo pipefail
+          response=$(curl -sS -X POST https://api.autonoma.app/v1/runs \
+            -H "Authorization: Bearer $AUTONOMA_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"base_url\": \"$PREVIEW_URL\", \"commit\": \"${{ github.event.pull_request.head.sha }}\"}")
+          run_id=$(echo "$response" | jq -r '.run_id')
+          if [[ -z "$run_id" || "$run_id" == "null" ]]; then
+            echo "error: Autonoma did not return a run_id. Response: $response" >&2
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "Autonoma run started: $run_id"
+
+      - name: Wait for Autonoma results
+        id: wait
+        env:
+          AUTONOMA_API_KEY: ${{ secrets.AUTONOMA_API_KEY }}
+          RUN_ID: ${{ steps.trigger.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          # Poll every 15s for up to 30 minutes.
+          deadline=$(( $(date +%s) + 1800 ))
+          while (( $(date +%s) < deadline )); do
+            status_response=$(curl -sS \
+              -H "Authorization: Bearer $AUTONOMA_API_KEY" \
+              "https://api.autonoma.app/v1/runs/$RUN_ID")
+            status=$(echo "$status_response" | jq -r '.status')
+            echo "Autonoma status: $status"
+            case "$status" in
+              passed)
+                echo "result=passed" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              failed)
+                echo "result=failed" >> "$GITHUB_OUTPUT"
+                exit 1
+                ;;
+              running|queued|pending)
+                sleep 15
+                ;;
+              *)
+                echo "error: unexpected Autonoma status '$status'. Response: $status_response" >&2
+                echo "result=error" >> "$GITHUB_OUTPUT"
+                exit 1
+                ;;
+            esac
+          done
+          echo "error: Autonoma run did not complete within 30 minutes." >&2
+          echo "result=timeout" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Report final status
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          RESULT: ${{ steps.wait.outputs.result }}
+          RUN_ID: ${{ steps.trigger.outputs.run_id }}
+        with:
+          script: |
+            const result = process.env.RESULT || 'error';
+            const runId = process.env.RUN_ID || '';
+            const state = result === 'passed' ? 'success' : 'failure';
+            const description =
+              result === 'passed' ? 'E2E tests passed' :
+              result === 'failed' ? 'E2E tests failed' :
+              result === 'timeout' ? 'E2E tests timed out' :
+              'E2E tests errored';
+            const target_url = runId
+              ? `https://app.autonoma.app/runs/${runId}`
+              : undefined;
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state,
+              context: 'autonoma/e2e',
+              description,
+              target_url,
+            });
+
+  destroy-preview:
+    # Tear down the Fly preview app when the PR closes (merged or not).
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Destroy Fly preview app
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          bash scripts/fly-preview.sh destroy \
+            "${{ github.event.pull_request.number }}" \
+            "$BASE_APP_NAME"
